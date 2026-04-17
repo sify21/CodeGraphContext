@@ -173,5 +173,15 @@ from .database import DatabaseManager
 from .database_falkordb import FalkorDBManager
 from .database_falkordb_remote import FalkorDBRemoteManager
 from .database_kuzu import KuzuDBManager
+from .transaction import BackendCapabilities, ExecutionContext, TransactionContext
 
-__all__ = ['DatabaseManager', 'FalkorDBManager', 'FalkorDBRemoteManager', 'KuzuDBManager', 'get_database_manager']
+__all__ = [
+    'DatabaseManager',
+    'FalkorDBManager',
+    'FalkorDBRemoteManager',
+    'KuzuDBManager',
+    'BackendCapabilities',
+    'ExecutionContext',
+    'TransactionContext',
+    'get_database_manager',
+]

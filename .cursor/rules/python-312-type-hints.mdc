@@ -1,0 +1,39 @@
+---
+description: Python 3.12+ type hint style requirements
+globs: **/*.py
+alwaysApply: false
+---
+
+# Python 3.12+ Type Hints
+
+在生成或修改 Python 代码时，类型注解遵循 Python 3.12+ 风格：
+
+- 使用 `X | Y` 联合类型，不使用 `typing.Union[X, Y]`
+- 使用 `T | None` 表达可空类型，不使用 `typing.Optional[T]`
+- 使用内置泛型 `list[T]`、`dict[K, V]`、`set[T]`、`tuple[...]`，不使用 `typing.List/Dict/Set/Tuple`
+- 仅在确有必要时引入 `typing` 中仍有价值的类型（如 `TypedDict`、`Protocol`、`Literal`）
+- 新增代码应避免引入已过时的 typing 写法；如触及相关代码，优先顺手升级为 3.12+ 风格
+
+```python
+# ❌ BAD
+from typing import Optional, List, Dict, Union
+
+def parse(items: Optional[List[str]]) -> Dict[str, Union[int, None]]:
+    ...
+
+# ✅ GOOD
+def parse(items: list[str] | None) -> dict[str, int | None]:
+    ...
+```
+
+```python
+# ❌ BAD
+from typing import Tuple, Set
+
+def build(values: Set[int]) -> Tuple[int, ...]:
+    ...
+
+# ✅ GOOD
+def build(values: set[int]) -> tuple[int, ...]:
+    ...
+```

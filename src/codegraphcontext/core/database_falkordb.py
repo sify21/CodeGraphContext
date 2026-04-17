@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 from codegraphcontext.utils.debug_log import debug_log, info_logger, error_logger, warning_logger
+from .transaction import BackendCapabilities
 
 # ---------------------------------------------------------------------------
 # Compatibility patch: redis-py >= 5.x added OpenTelemetry error telemetry that
@@ -276,6 +277,27 @@ class FalkorDBManager:
     def get_backend_type(self) -> str:
         """Returns the database backend type."""
         return 'falkordb'
+
+    def get_capabilities(self) -> BackendCapabilities:
+        """
+        Returns backend capabilities for orchestration decisions.
+
+        FalkorDB wrapper currently operates in auto-commit session mode.
+        """
+        return BackendCapabilities(
+            backend="falkordb",
+            supports_transactions=False,
+            supports_concurrent_writes=False,
+            supports_session_scoped_reads=False,
+        )
+
+    def open_session(self):
+        """Opens a backend session through the existing driver wrapper."""
+        return self.get_driver().session()
+
+    def begin_transaction(self):
+        """Explicit transactions are not exposed in the current FalkorDB wrapper."""
+        return None
 
 
     @staticmethod

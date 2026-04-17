@@ -2,6 +2,7 @@
 import logging
 
 from typing import Any, Dict, List, Literal, Optional
+from contextlib import contextmanager
 from pathlib import Path
 
 from ..core.database import DatabaseManager
@@ -10,11 +11,20 @@ logger = logging.getLogger(__name__)
 
 class CodeFinder:
     """Module for finding relevant code snippets and analyzing relationships."""
+    _CALL_CHAIN_LABEL_WHITELIST = {"Function", "Class", "File", "Module"}
 
     def __init__(self, db_manager: DatabaseManager):
         self.db_manager = db_manager
         self.driver = self.db_manager.get_driver()
         self._is_falkordb = getattr(db_manager, 'get_backend_type', lambda: 'neo4j')() != 'neo4j'
+
+    @contextmanager
+    def _execution_context(self, execution_context=None):
+        if execution_context is not None:
+            yield execution_context
+            return
+        with self.driver.session() as session:
+            yield session
 
     def format_query(self, find_by: Literal["Class", "Function"], fuzzy_search:bool, repo_path: Optional[str] = None) -> str:
         """Format the search query based on the search type and fuzzy search settings."""
@@ -635,9 +645,18 @@ class CodeFinder:
                 result = session.run(query, function_name=function_name, repo_path=repo_path)
             return result.data()
 
-    def find_function_call_chain(self, start_function: str, end_function: str, max_depth: int = 5, start_file: Optional[str] = None, end_file: Optional[str] = None, repo_path: Optional[str] = None) -> List[Dict]:
+    def find_function_call_chain(
+        self,
+        start_function: str,
+        end_function: str,
+        max_depth: int = 5,
+        start_file: Optional[str] = None,
+        end_file: Optional[str] = None,
+        repo_path: Optional[str] = None,
+        execution_context=None,
+    ) -> List[Dict]:
         """Find call chains between two functions"""
-        with self.driver.session() as session:
+        with self._execution_context(execution_context) as session:
             # Build match clauses based on whether files are specified
             start_props = "{name: $start_function" + (", path: $start_file}" if start_file else "}")
             end_props = "{name: $end_function" + (", path: $end_file}" if end_file else "}")
@@ -680,6 +699,259 @@ class CodeFinder:
             
             result = session.run(query, **params)
             return result.data()
+
+    def find_call_chain_starts(self, execution_context=None) -> list[dict[str, Any]]:
+        """Return all start points for CALLS chains (outgoing CALLS and no incoming CALLS)."""
+        with self._execution_context(execution_context) as session:
+            result = session.run("""
+                MATCH (start)-[:CALLS]->()
+                WHERE NOT ()-[:CALLS]->(start)
+                WITH DISTINCT start
+                RETURN
+                    CASE
+                        WHEN start:Function THEN 'Function'
+                        WHEN start:Class THEN 'Class'
+                        WHEN start:File THEN 'File'
+                        WHEN start:Module THEN 'Module'
+                        ELSE head(labels(start))
+                    END as label,
+                    properties(start) as props
+                ORDER BY coalesce(start.path, ''), coalesce(start.line_number, 0), coalesce(start.name, '')
+            """)
+            return result.data()
+
+    def find_call_chains_from_node(
+        self,
+        label: str,
+        props: Dict[str, Any],
+        max_depth: Optional[int] = None,
+        limit: Optional[int] = None,
+        execution_context=None,
+    ) -> Dict[str, Any]:
+        """
+        Return all call chains from a start node to sink nodes.
+        A sink node is any node with no outgoing CALLS edge.
+        """
+        if label not in self._CALL_CHAIN_LABEL_WHITELIST:
+            raise ValueError(f"Unsupported label '{label}'. Supported labels: {sorted(self._CALL_CHAIN_LABEL_WHITELIST)}")
+        if not isinstance(props, dict) or not props:
+            raise ValueError("start.props must be a non-empty object")
+        if max_depth is not None and (not isinstance(max_depth, int) or isinstance(max_depth, bool)):
+            raise ValueError("max_depth must be an integer")
+        if max_depth is not None and max_depth < 1:
+            raise ValueError("max_depth must be >= 1")
+        if limit is not None and (not isinstance(limit, int) or isinstance(limit, bool)):
+            raise ValueError("limit must be an integer")
+        if limit is not None and limit < 1:
+            raise ValueError("limit must be >= 1")
+
+        depth_pattern = "*1.." if max_depth is None else f"*1..{max_depth}"
+        limit_clause = f"LIMIT {limit}" if limit is not None else ""
+
+        with self._execution_context(execution_context) as session:
+            start_match_result = session.run(f"""
+                MATCH (start:{label})
+                WHERE all(k IN keys($props) WHERE start[k] = $props[k])
+                RETURN
+                    CASE
+                        WHEN start:Function THEN 'Function'
+                        WHEN start:Class THEN 'Class'
+                        WHEN start:File THEN 'File'
+                        WHEN start:Module THEN 'Module'
+                        ELSE head(labels(start))
+                    END as label,
+                    properties(start) as props
+                LIMIT 2
+            """, props=props)
+            start_matches = start_match_result.data()
+
+            if not start_matches:
+                raise ValueError("No start node matched the provided label + props.")
+            if len(start_matches) > 1:
+                raise ValueError("Provided label + props matched multiple nodes. Add more identifying props.")
+
+            start_point = start_matches[0]
+
+            chains_result = session.run(f"""
+                MATCH (start:{label})
+                WHERE all(k IN keys($props) WHERE start[k] = $props[k])
+                MATCH path = (start)-[:CALLS{depth_pattern}]->(sink)
+                WHERE NOT (sink)-[:CALLS]->()
+                RETURN
+                    [node IN nodes(path) | {{
+                        label:
+                            CASE
+                                WHEN node:Function THEN 'Function'
+                                WHEN node:Class THEN 'Class'
+                                WHEN node:File THEN 'File'
+                                WHEN node:Module THEN 'Module'
+                                ELSE head(labels(node))
+                            END,
+                        props: properties(node)
+                    }}] as node_chain,
+                    [rel IN relationships(path) | {{
+                        line_number: rel.line_number,
+                        args: rel.args,
+                        full_call_name: rel.full_call_name,
+                        source: rel.source,
+                        is_rpc: rel.is_rpc
+                    }}] as call_details,
+                    length(path) as chain_length
+                ORDER BY chain_length ASC
+                {limit_clause}
+            """, props=props)
+
+            chains = chains_result.data()
+            return {
+                "start_point": start_point,
+                "chains": chains,
+                "total_chains": len(chains),
+            }
+
+    def find_call_paths_around_node(
+        self,
+        label: str,
+        props: Dict[str, Any],
+        max_depth: int = 6,
+        limit: int = 200,
+        execution_context=None,
+    ) -> Dict[str, Any]:
+        """
+        Return bounded CALLS paths around a node in both directions.
+
+        - Downstream: center -> ... (callees)
+        - Upstream: ... -> center (callers)
+        """
+        if label not in self._CALL_CHAIN_LABEL_WHITELIST:
+            raise ValueError(f"Unsupported label '{label}'. Supported labels: {sorted(self._CALL_CHAIN_LABEL_WHITELIST)}")
+        if not isinstance(props, dict) or not props:
+            raise ValueError("props must be a non-empty object")
+        if not isinstance(max_depth, int) or isinstance(max_depth, bool):
+            raise ValueError("max_depth must be an integer")
+        if max_depth < 1:
+            raise ValueError("max_depth must be >= 1")
+        if not isinstance(limit, int) or isinstance(limit, bool):
+            raise ValueError("limit must be an integer")
+        if limit < 1:
+            raise ValueError("limit must be >= 1")
+
+        depth_pattern = f"*1..{max_depth}"
+        per_dir_limit = limit
+
+        with self._execution_context(execution_context) as session:
+            center_match_result = session.run(f"""
+                MATCH (center:{label})
+                WHERE all(k IN keys($props) WHERE center[k] = $props[k])
+                RETURN
+                    CASE
+                        WHEN center:Function THEN 'Function'
+                        WHEN center:Class THEN 'Class'
+                        WHEN center:File THEN 'File'
+                        WHEN center:Module THEN 'Module'
+                        ELSE head(labels(center))
+                    END as label,
+                    properties(center) as props
+                LIMIT 2
+            """, props=props)
+            center_matches = center_match_result.data()
+
+            if not center_matches:
+                raise ValueError("No center node matched the provided label + props.")
+            if len(center_matches) > 1:
+                raise ValueError("Provided label + props matched multiple nodes. Add more identifying props.")
+
+            center_point = center_matches[0]
+
+            downstream_result = session.run(f"""
+                MATCH (center:{label})
+                WHERE all(k IN keys($props) WHERE center[k] = $props[k])
+                MATCH path = (center)-[:CALLS{depth_pattern}]->(dst)
+                WHERE NOT (dst)-[:CALLS]->() OR length(path) = {max_depth}
+                RETURN
+                    [node IN nodes(path) | {{
+                        label:
+                            CASE
+                                WHEN node:Function THEN 'Function'
+                                WHEN node:Class THEN 'Class'
+                                WHEN node:File THEN 'File'
+                                WHEN node:Module THEN 'Module'
+                                ELSE head(labels(node))
+                            END,
+                        props: properties(node)
+                    }}] as node_chain,
+                    [rel IN relationships(path) | {{
+                        line_number: rel.line_number,
+                        args: rel.args,
+                        full_call_name: rel.full_call_name,
+                        source: rel.source,
+                        is_rpc: rel.is_rpc
+                    }}] as call_details,
+                    length(path) as chain_length
+                ORDER BY chain_length DESC
+                LIMIT {per_dir_limit}
+            """, props=props)
+
+            upstream_result = session.run(f"""
+                MATCH (center:{label})
+                WHERE all(k IN keys($props) WHERE center[k] = $props[k])
+                MATCH path = (src)-[:CALLS{depth_pattern}]->(center)
+                WHERE NOT ()-[:CALLS]->(src) OR length(path) = {max_depth}
+                RETURN
+                    [node IN nodes(path) | {{
+                        label:
+                            CASE
+                                WHEN node:Function THEN 'Function'
+                                WHEN node:Class THEN 'Class'
+                                WHEN node:File THEN 'File'
+                                WHEN node:Module THEN 'Module'
+                                ELSE head(labels(node))
+                            END,
+                        props: properties(node)
+                    }}] as node_chain,
+                    [rel IN relationships(path) | {{
+                        line_number: rel.line_number,
+                        args: rel.args,
+                        full_call_name: rel.full_call_name,
+                        source: rel.source,
+                        is_rpc: rel.is_rpc
+                    }}] as call_details,
+                    length(path) as chain_length
+                ORDER BY chain_length DESC
+                LIMIT {per_dir_limit}
+            """, props=props)
+
+            downstream_chains = downstream_result.data()
+            upstream_chains = upstream_result.data()
+            stitched_chains: list[dict[str, Any]] = []
+
+            if upstream_chains and downstream_chains:
+                for up in upstream_chains:
+                    up_nodes = up.get("node_chain") or []
+                    up_calls = up.get("call_details") or []
+                    for down in downstream_chains:
+                        down_nodes = down.get("node_chain") or []
+                        down_calls = down.get("call_details") or []
+                        # Both paths include center; keep it only once in stitched chain.
+                        merged_nodes = up_nodes + down_nodes[1:]
+                        merged_calls = up_calls + down_calls
+                        stitched_chains.append({
+                            "node_chain": merged_nodes,
+                            "call_details": merged_calls,
+                            "chain_length": len(merged_calls),
+                        })
+            elif upstream_chains:
+                stitched_chains = upstream_chains
+            elif downstream_chains:
+                stitched_chains = downstream_chains
+
+            stitched_chains.sort(key=lambda chain: chain.get("chain_length", 0), reverse=True)
+            chains = stitched_chains[:limit]
+
+            return {
+                "center_point": center_point,
+                "chains": chains,
+                "total_chains": len(chains),
+            }
 
     def find_by_type(self, element_type: str, limit: int = 50) -> List[Dict]:
         """Find all elements of a specific type (Function, Class, File, Module)."""
@@ -998,9 +1270,9 @@ class CodeFinder:
             result = session.run(query, limit=limit, repo_path=repo_path)
             return result.data()
 
-    def list_indexed_repositories(self) -> List[Dict]:
+    def list_indexed_repositories(self, execution_context=None) -> List[Dict]:
         """List all indexed repositories."""
-        with self.driver.session() as session:
+        with self._execution_context(execution_context) as session:
             result = session.run("""
                 MATCH (r:Repository)
                 RETURN r.name as name, r.path as path, r.is_dependency as is_dependency

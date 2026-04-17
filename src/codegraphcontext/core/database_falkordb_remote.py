@@ -22,6 +22,7 @@ import threading
 from typing import Optional, Tuple
 
 from codegraphcontext.utils.debug_log import info_logger, error_logger
+from .transaction import BackendCapabilities
 
 # Reuse the Neo4j-compatible wrapper classes from the embedded FalkorDB module
 from codegraphcontext.core.database_falkordb import (
@@ -136,6 +137,23 @@ class FalkorDBRemoteManager:
     def get_backend_type(self) -> str:
         """Returns the database backend type."""
         return 'falkordb-remote'
+
+    def get_capabilities(self) -> BackendCapabilities:
+        """Returns backend capabilities for orchestration decisions."""
+        return BackendCapabilities(
+            backend="falkordb-remote",
+            supports_transactions=False,
+            supports_concurrent_writes=False,
+            supports_session_scoped_reads=False,
+        )
+
+    def open_session(self):
+        """Opens a backend session through the existing driver wrapper."""
+        return self.get_driver().session()
+
+    def begin_transaction(self):
+        """Explicit transactions are not exposed in the current FalkorDB wrapper."""
+        return None
 
     @staticmethod
     def validate_config() -> Tuple[bool, Optional[str]]:

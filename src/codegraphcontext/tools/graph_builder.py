@@ -3,6 +3,7 @@
 import asyncio
 import pathspec
 from pathlib import Path
+from contextlib import contextmanager
 from typing import Any, Coroutine, Dict, Optional, Tuple
 from datetime import datetime
 
@@ -135,11 +136,25 @@ class GraphBuilder:
         }
         self.create_schema()
 
+    @contextmanager
+    def _execution_context(self, execution_context=None):
+        """
+        Yield a provided execution context, or open a new driver session.
+
+        This keeps backward compatibility while allowing upper layers to inject
+        a shared session/transaction object.
+        """
+        if execution_context is not None:
+            yield execution_context
+            return
+        with self.driver.session() as session:
+            yield session
+
     # A general schema creation based on common features across languages
-    def create_schema(self):
+    def create_schema(self, execution_context=None):
         """Create constraints and indexes in Neo4j."""
         # When adding a new node type with a unique key, add its constraint here.
-        with self.driver.session() as session:
+        with self._execution_context(execution_context) as session:
             try:
                 session.run("CREATE CONSTRAINT repository_path IF NOT EXISTS FOR (r:Repository) REQUIRE r.path IS UNIQUE")
                 session.run("CREATE CONSTRAINT path IF NOT EXISTS FOR (f:File) REQUIRE f.path IS UNIQUE")
@@ -280,11 +295,11 @@ class GraphBuilder:
         return imports_map
 
     # Language-agnostic method
-    def add_repository_to_graph(self, repo_path: Path, is_dependency: bool = False):
+    def add_repository_to_graph(self, repo_path: Path, is_dependency: bool = False, execution_context=None):
         """Adds a repository node using its absolute path as the unique key."""
         repo_name = repo_path.name
         repo_path_str = str(repo_path.resolve())
-        with self.driver.session() as session:
+        with self._execution_context(execution_context) as session:
             session.run(
                 """
                 MERGE (r:Repository {path: $path})
@@ -296,7 +311,7 @@ class GraphBuilder:
             )
 
     # First pass to add file and its contents
-    def add_file_to_graph(self, file_data: Dict, repo_name: str, imports_map: dict):
+    def add_file_to_graph(self, file_data: Dict, repo_name: str, imports_map: dict, execution_context=None):
         calls_count = len(file_data.get('function_calls', []))
         debug_log(f"Executing add_file_to_graph for {file_data.get('path', 'unknown')} - Calls found: {calls_count}")
         """Adds a file and its contents within a single, unified session."""
@@ -304,7 +319,7 @@ class GraphBuilder:
         file_name = Path(file_path_str).name
         is_dependency = file_data.get('is_dependency', False)
 
-        with self.driver.session() as session:
+        with self._execution_context(execution_context) as session:
             try:
                 # Match repository by path, not name, to avoid conflicts with same-named folders at different locations
                 repo_result = session.run("MATCH (r:Repository {path: $repo_path}) RETURN r.path as path", repo_path=str(Path(file_data['repo_path']).resolve())).single()
@@ -644,7 +659,7 @@ class GraphBuilder:
                     OPTIONAL MATCH (called:Function {name: $called_name, path: $called_file_path})
                     WITH caller, called
                     WHERE caller IS NOT NULL AND called IS NOT NULL
-                    MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
+                    MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name, is_rpc: false}]->(called)
                     RETURN count(*) as created
                 """, call_params):
                 
@@ -656,7 +671,7 @@ class GraphBuilder:
                         WHERE init.name IN ["__init__", "constructor"]
                         WITH caller, COALESCE(init, called) as final_target
                         WHERE caller IS NOT NULL AND final_target IS NOT NULL
-                        MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(final_target)
+                        MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name, is_rpc: false}]->(final_target)
                         RETURN count(*) as created
                     """, call_params):
                 
@@ -666,7 +681,7 @@ class GraphBuilder:
                             OPTIONAL MATCH (called:Function {name: $called_name, path: $called_file_path})
                             WITH caller, called
                             WHERE caller IS NOT NULL AND called IS NOT NULL
-                            MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
+                            MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name, is_rpc: false}]->(called)
                             RETURN count(*) as created
                         """, call_params):
                 
@@ -678,7 +693,7 @@ class GraphBuilder:
                                 WHERE init.name IN ["__init__", "constructor"]
                                 WITH caller, COALESCE(init, called) as final_target
                                 WHERE caller IS NOT NULL AND final_target IS NOT NULL
-                                MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(final_target)
+                                MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name, is_rpc: false}]->(final_target)
                                 RETURN count(*) as created
                             """, call_params):
 
@@ -691,7 +706,7 @@ class GraphBuilder:
                                     OPTIONAL MATCH (called:Function {name: $called_name})
                                     WITH final_caller, called
                                     WHERE final_caller IS NOT NULL AND called IS NOT NULL
-                                    MERGE (final_caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
+                                    MERGE (final_caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name, is_rpc: false}]->(called)
                                 """, call_params)
             else:
                 # File-level calls: Try Function first, then Class
@@ -709,7 +724,7 @@ class GraphBuilder:
                     OPTIONAL MATCH (called:Function {name: $called_name, path: $called_file_path})
                     WITH caller, called
                     WHERE caller IS NOT NULL AND called IS NOT NULL
-                    MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
+                    MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name, is_rpc: false}]->(called)
                     RETURN count(*) as created
                 """, call_params):
                 
@@ -720,7 +735,7 @@ class GraphBuilder:
                         WHERE init.name IN ["__init__", "constructor"]
                         WITH caller, COALESCE(init, called) as final_target
                         WHERE caller IS NOT NULL AND final_target IS NOT NULL
-                        MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(final_target)
+                        MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name, is_rpc: false}]->(final_target)
                         RETURN count(*) as created
                     """, call_params):
 
@@ -730,16 +745,484 @@ class GraphBuilder:
                             OPTIONAL MATCH (called:Function {name: $called_name})
                             WITH caller, called
                             WHERE caller IS NOT NULL AND called IS NOT NULL
-                            MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name}]->(called)
+                            MERGE (caller)-[:CALLS {line_number: $line_number, args: $args, full_call_name: $full_call_name, is_rpc: false}]->(called)
                         """, call_params)
 
-    def _create_all_function_calls(self, all_file_data: list[Dict], imports_map: dict):
+    def _create_all_function_calls(self, all_file_data: list[Dict], imports_map: dict, execution_context=None):
         """Create CALLS relationships for all functions after all files have been processed."""
         debug_log(f"_create_all_function_calls called with {len(all_file_data)} files")
-        with self.driver.session() as session:
+        with self._execution_context(execution_context) as session:
             for idx, file_data in enumerate(all_file_data):
                 debug_log(f"Processing file {idx+1}/{len(all_file_data)}: {file_data.get('path', 'unknown')}")
                 self._create_function_calls(session, file_data, imports_map)
+
+    def _set_rpc_node_properties(
+        self,
+        session,
+        label: str,
+        path: str,
+        name: str,
+        line_number: int,
+        props: Dict[str, Any],
+    ):
+        """给已存在的 Class/Function 节点补充 RPC 标识（不新增节点）。"""
+        if not name or line_number is None or int(line_number) <= 0:
+            return
+
+        set_parts = ["n.is_rpc = true"]
+        params: Dict[str, Any] = {
+            "path": path,
+            "name": name,
+            "line_number": line_number,
+        }
+        # rpc_kind / rpc_role 使用多值合并，避免后写覆盖
+        kind_val = props.get("rpc_kind")
+        if kind_val:
+            params["rpc_kind"] = kind_val
+            set_parts.append(
+                "n.rpc_kind = CASE "
+                "WHEN coalesce(n.rpc_kind, '') = '' THEN $rpc_kind "
+                "ELSE n.rpc_kind END"
+            )
+            set_parts.append(
+                "n.rpc_kinds = CASE "
+                "WHEN coalesce(n.rpc_kinds, '') = '' THEN $rpc_kind "
+                "WHEN (';' + n.rpc_kinds + ';') CONTAINS (';' + $rpc_kind + ';') THEN n.rpc_kinds "
+                "ELSE n.rpc_kinds + ';' + $rpc_kind END"
+            )
+
+        role_val = props.get("rpc_role")
+        if role_val:
+            params["rpc_role"] = role_val
+            set_parts.append(
+                "n.rpc_role = CASE "
+                "WHEN coalesce(n.rpc_role, '') = '' THEN $rpc_role "
+                "ELSE n.rpc_role END"
+            )
+            set_parts.append(
+                "n.rpc_roles = CASE "
+                "WHEN coalesce(n.rpc_roles, '') = '' THEN $rpc_role "
+                "WHEN (';' + n.rpc_roles + ';') CONTAINS (';' + $rpc_role + ';') THEN n.rpc_roles "
+                "ELSE n.rpc_roles + ';' + $rpc_role END"
+            )
+
+        for key, value in props.items():
+            if key in ("rpc_kind", "rpc_role"):
+                continue
+            if value is None or value == "":
+                continue
+            set_parts.append(f"n.{key} = ${key}")
+            params[key] = value
+        if not set_parts:
+            return
+        set_clause = ", ".join(set_parts)
+        session.run(
+            f"""
+                MATCH (n:{label} {{name: $name, path: $path, line_number: $line_number}})
+                SET {set_clause}
+            """,
+            **params,
+        )
+
+    def _apply_rpc_node_markers(self, session, file_data: Dict):
+        """将 Java parser 返回的 rpc 独立结果回填到 Function/Class 节点属性。"""
+        if file_data.get("lang") != "java":
+            return
+        rpc = file_data.get("rpc") or {}
+        if not rpc:
+            return
+        file_path = str(Path(file_data["path"]).resolve())
+
+        for row in rpc.get("spring_http_controllers", []):
+            self._set_rpc_node_properties(
+                session,
+                "Class",
+                file_path,
+                row.get("name", ""),
+                int(row.get("line_number", 0)),
+                {
+                    "is_rpc_component": True,
+                    "rpc_protocol": "http",
+                    "rpc_role": "server",
+                    "rpc_kind": "spring_http_controller",
+                    "rpc_class_level_path": row.get("class_level_path", ""),
+                },
+            )
+
+        for row in rpc.get("feign_interfaces", []):
+            self._set_rpc_node_properties(
+                session,
+                "Class",
+                file_path,
+                row.get("name", ""),
+                int(row.get("line_number", 0)),
+                {
+                    "is_rpc_component": True,
+                    "rpc_protocol": "http",
+                    "rpc_role": "client",
+                    "rpc_kind": "feign_client_interface",
+                    "rpc_base_url": row.get("base_url", ""),
+                    "rpc_service_name": row.get("service_name", ""),
+                },
+            )
+
+        for row in rpc.get("grpc_service_classes", []):
+            self._set_rpc_node_properties(
+                session,
+                "Class",
+                file_path,
+                row.get("name", ""),
+                int(row.get("line_number", 0)),
+                {
+                    "is_rpc_component": True,
+                    "rpc_protocol": "grpc",
+                    "rpc_role": "server",
+                    "rpc_kind": "grpc_service_class",
+                    "rpc_superclass": row.get("superclass", ""),
+                },
+            )
+
+        for row in rpc.get("grpc_stub_classes", []):
+            self._set_rpc_node_properties(
+                session,
+                "Class",
+                file_path,
+                row.get("name", ""),
+                int(row.get("line_number", 0)),
+                {
+                    "is_rpc_component": True,
+                    "rpc_protocol": "grpc",
+                    "rpc_role": "client",
+                    "rpc_kind": "grpc_stub_class",
+                    "rpc_superclass": row.get("superclass", ""),
+                },
+            )
+
+        for row in rpc.get("spring_http_endpoints", []):
+            self._set_rpc_node_properties(
+                session,
+                "Function",
+                file_path,
+                row.get("name", ""),
+                int(row.get("line_number", 0)),
+                {
+                    "is_rpc_endpoint": True,
+                    "rpc_protocol": "http",
+                    "rpc_role": "server",
+                    "rpc_kind": "spring_http_endpoint",
+                    "rpc_http_method": row.get("http_method", ""),
+                    "rpc_full_path": row.get("full_path", ""),
+                },
+            )
+
+        for row in rpc.get("feign_methods", []):
+            self._set_rpc_node_properties(
+                session,
+                "Function",
+                file_path,
+                row.get("name", ""),
+                int(row.get("line_number", 0)),
+                {
+                    "is_rpc_endpoint": True,
+                    "rpc_protocol": "http",
+                    "rpc_role": "client",
+                    "rpc_kind": "feign_client_method",
+                    "rpc_http_method": row.get("http_method", ""),
+                    "rpc_full_path": row.get("full_path", ""),
+                    "rpc_base_url": row.get("base_url", ""),
+                    "rpc_service_name": row.get("service_name", ""),
+                },
+            )
+
+        for row in rpc.get("grpc_service_endpoints", []):
+            self._set_rpc_node_properties(
+                session,
+                "Function",
+                file_path,
+                row.get("name", ""),
+                int(row.get("line_number", 0)),
+                {
+                    "is_rpc_endpoint": True,
+                    "rpc_protocol": "grpc",
+                    "rpc_role": "server",
+                    "rpc_kind": "grpc_service_endpoint",
+                    "rpc_service_name": row.get("service_context", ""),
+                },
+            )
+
+        for row in rpc.get("grpc_stub_methods", []):
+            self._set_rpc_node_properties(
+                session,
+                "Function",
+                file_path,
+                row.get("name", ""),
+                int(row.get("line_number", 0)),
+                {
+                    "is_rpc_component": True,
+                    "rpc_protocol": "grpc",
+                    "rpc_role": "client",
+                    "rpc_kind": "grpc_stub_method",
+                },
+            )
+
+    def _create_rpc_calls(self, session, file_data: Dict):
+        """
+        根据 Java parser 的独立 rpc 字段补充 RPC 调用边。
+        当前支持：
+        - Feign method -> Spring endpoint（HTTP，按 method+full_path）
+        - gRPC stub method -> gRPC service endpoint（生成 Stub 代码入库场景，按方法名）
+        - gRPC client call -> gRPC service endpoint（按 rpc 方法名，stub 不可用时兜底）
+        """
+        if file_data.get("lang") != "java":
+            return
+        rpc = file_data.get("rpc") or {}
+        if not rpc:
+            return
+
+        file_path = str(Path(file_data["path"]).resolve())
+
+        def _has_grpc_stub_hop(
+            caller_mode: str,
+            caller_name: str,
+            caller_path: str,
+            caller_line: Optional[int],
+            call_line: int,
+            called_name: str,
+        ) -> bool:
+            """
+            判断当前调用点是否已存在 caller -> grpc_stub_method 的普通 CALLS 边。
+            命中则说明“分层链路”可用，可跳过 client call->service endpoint 直连兜底边。
+            """
+            params: Dict[str, Any] = {
+                "caller_name": caller_name,
+                "caller_path": caller_path,
+                "caller_line": caller_line,
+                "call_line": call_line,
+                "called_name": called_name,
+            }
+            if caller_mode == "function":
+                query = """
+                    OPTIONAL MATCH (caller:Function {name: $caller_name, path: $caller_path, line_number: $caller_line})
+                    OPTIONAL MATCH (caller)-[r:CALLS {line_number: $call_line}]->(stub:Function {name: $called_name})
+                    WHERE (
+                        coalesce(stub.rpc_kind, '') = 'grpc_stub_method'
+                        OR coalesce(stub.rpc_kinds, '') CONTAINS 'grpc_stub_method'
+                    )
+                    WITH caller, r, stub
+                    RETURN (caller IS NOT NULL AND r IS NOT NULL AND stub IS NOT NULL) AS has_stub_hop
+                """
+            else:
+                query = """
+                    OPTIONAL MATCH (caller:File {path: $caller_path})
+                    OPTIONAL MATCH (caller)-[r:CALLS {line_number: $call_line}]->(stub:Function {name: $called_name})
+                    WHERE (
+                        coalesce(stub.rpc_kind, '') = 'grpc_stub_method'
+                        OR coalesce(stub.rpc_kinds, '') CONTAINS 'grpc_stub_method'
+                    )
+                    WITH caller, r, stub
+                    RETURN (caller IS NOT NULL AND r IS NOT NULL AND stub IS NOT NULL) AS has_stub_hop
+                """
+            try:
+                rec = session.run(query, **params).single()
+                return bool(rec and rec.get("has_stub_hop", False))
+            except Exception:
+                return False
+
+        # 用通用 function_calls 反查 caller context（函数内调用优先）
+        call_ctx_map: Dict[tuple[int, str], tuple[Any, Any, Any]] = {}
+        for call in file_data.get("function_calls", []):
+            key = (int(call.get("line_number", 0)), call.get("name", ""))
+            ctx = call.get("context")
+            if key[0] <= 0 or not key[1] or not isinstance(ctx, (tuple, list)) or len(ctx) != 3:
+                continue
+            call_ctx_map[key] = (ctx[0], ctx[1], ctx[2])
+
+        # HTTP: Feign -> Spring Controller endpoint
+        for row in rpc.get("feign_methods", []):
+            full_path = row.get("full_path", "")
+            http_method = row.get("http_method", "")
+            if not full_path or not http_method:
+                continue
+
+            params = {
+                "caller_name": row.get("name", ""),
+                "caller_path": file_path,
+                "caller_line": int(row.get("line_number", 0)),
+                "line_number": int(row.get("line_number", 0)),
+                "called_http_method": http_method,
+                "called_full_path": full_path,
+                "full_call_name": full_path,
+            }
+
+            self._safe_run_create(
+                session,
+                """
+                OPTIONAL MATCH (caller:Function {name: $caller_name, path: $caller_path, line_number: $caller_line})
+                OPTIONAL MATCH (called:Function)
+                WHERE called.is_rpc_endpoint = true
+                  AND called.rpc_protocol = 'http'
+                  AND called.rpc_role = 'server'
+                  AND called.rpc_http_method = $called_http_method
+                  AND called.rpc_full_path = $called_full_path
+                WITH caller, called
+                WHERE caller IS NOT NULL AND called IS NOT NULL
+                MERGE (caller)-[r:CALLS {
+                    line_number: $line_number,
+                    full_call_name: $full_call_name
+                }]->(called)
+                SET r.args = coalesce(r.args, []),
+                    r.is_rpc = true,
+                    r.rpc_protocol = 'http',
+                    r.rpc_kind = 'feign_to_controller'
+                RETURN count(*) as created
+                """,
+                params,
+            )
+
+        # gRPC: stub method -> service endpoint
+        # 适用于“生成 Stub 代码入库”的场景：stub 方法名通常与 service rpc 方法名一致。
+        for row in rpc.get("grpc_stub_methods", []):
+            method_name = row.get("name", "")
+            line_number = int(row.get("line_number", 0))
+            if not method_name or line_number <= 0:
+                continue
+
+            params = {
+                "caller_name": method_name,
+                "caller_path": file_path,
+                "caller_line": line_number,
+                "called_name": method_name,
+                "line_number": line_number,
+                "full_call_name": method_name,
+            }
+
+            self._safe_run_create(
+                session,
+                """
+                OPTIONAL MATCH (caller:Function {name: $caller_name, path: $caller_path, line_number: $caller_line})
+                OPTIONAL MATCH (called:Function)
+                WHERE called.is_rpc_endpoint = true
+                  AND called.rpc_protocol = 'grpc'
+                  AND called.rpc_role = 'server'
+                  AND called.name = $called_name
+                WITH caller, called
+                WHERE caller IS NOT NULL AND called IS NOT NULL
+                MERGE (caller)-[r:CALLS {
+                    line_number: $line_number,
+                    full_call_name: $full_call_name
+                }]->(called)
+                SET r.args = coalesce(r.args, []),
+                    r.is_rpc = true,
+                    r.rpc_protocol = 'grpc',
+                    r.rpc_kind = 'grpc_stub_to_service'
+                RETURN count(*) as created
+                """,
+                params,
+            )
+
+        # gRPC: client call -> service endpoint（兜底）
+        for row in rpc.get("grpc_client_calls", []):
+            method_name = row.get("name", "")
+            line_number = int(row.get("line_number", 0))
+            if not method_name or line_number <= 0:
+                continue
+
+            full_call_name = f"{row.get('receiver', '')}.{method_name}".strip(".")
+            params = {
+                "called_name": method_name,
+                "line_number": line_number,
+                "full_call_name": full_call_name,
+                "rpc_receiver": row.get("receiver", ""),
+            }
+
+            caller_ctx = call_ctx_map.get((line_number, method_name))
+            if caller_ctx and caller_ctx[0] is not None:
+                caller_name = caller_ctx[0]
+                caller_line = int(caller_ctx[2]) if caller_ctx[2] is not None else None
+                # 若已存在 caller -> stub_method，则跳过 client->service 直连边
+                if caller_line is not None and _has_grpc_stub_hop(
+                    "function", caller_name, file_path, caller_line, line_number, method_name
+                ):
+                    continue
+                params.update(
+                    {
+                        "caller_name": caller_name,
+                        "caller_path": file_path,
+                        "caller_line": caller_line,
+                    }
+                )
+                self._safe_run_create(
+                    session,
+                    """
+                    OPTIONAL MATCH (caller:Function {name: $caller_name, path: $caller_path, line_number: $caller_line})
+                    OPTIONAL MATCH (called:Function)
+                    WHERE called.is_rpc_endpoint = true
+                      AND called.rpc_protocol = 'grpc'
+                      AND called.rpc_role = 'server'
+                      AND called.name = $called_name
+                    WITH caller, called
+                    WHERE caller IS NOT NULL AND called IS NOT NULL
+                    MERGE (caller)-[r:CALLS {
+                        line_number: $line_number,
+                        full_call_name: $full_call_name
+                    }]->(called)
+                    SET r.args = coalesce(r.args, []),
+                        r.is_rpc = true,
+                        r.rpc_protocol = 'grpc',
+                        r.rpc_kind = 'grpc_client_to_service',
+                        r.rpc_receiver = $rpc_receiver
+                    RETURN count(*) as created
+                    """,
+                    params,
+                )
+            else:
+                # 文件级调用若已存在 File -> stub_method，同样跳过直连兜底
+                if _has_grpc_stub_hop(
+                    "file", "", file_path, None, line_number, method_name
+                ):
+                    continue
+                params["caller_path"] = file_path
+                self._safe_run_create(
+                    session,
+                    """
+                    OPTIONAL MATCH (caller:File {path: $caller_path})
+                    OPTIONAL MATCH (called:Function)
+                    WHERE called.is_rpc_endpoint = true
+                      AND called.rpc_protocol = 'grpc'
+                      AND called.rpc_role = 'server'
+                      AND called.name = $called_name
+                    WITH caller, called
+                    WHERE caller IS NOT NULL AND called IS NOT NULL
+                    MERGE (caller)-[r:CALLS {
+                        line_number: $line_number,
+                        full_call_name: $full_call_name
+                    }]->(called)
+                    SET r.args = coalesce(r.args, []),
+                        r.is_rpc = true,
+                        r.rpc_protocol = 'grpc',
+                        r.rpc_kind = 'grpc_client_to_service',
+                        r.rpc_receiver = $rpc_receiver
+                    RETURN count(*) as created
+                    """,
+                    params,
+                )
+
+    def _create_all_rpc_calls(self, all_file_data: list[Dict], execution_context=None):
+        """两阶段处理 RPC：先给节点打标，再建 RPC 调用边。"""
+        with self._execution_context(execution_context) as session:
+            for file_data in all_file_data:
+                self._apply_rpc_node_markers(session, file_data)
+            for file_data in all_file_data:
+                self._create_rpc_calls(session, file_data)
+            # 对同一调用点产生的并行 CALLS 关系做收敛，避免 rpc/非 rpc 双边并存
+            session.run("""
+                MATCH (a)-[r:CALLS]->(b)
+                WITH a, b, r.line_number AS ln, r.full_call_name AS fc, collect(r) AS rels
+                WHERE ln IS NOT NULL AND fc IS NOT NULL AND size(rels) > 1
+                WITH rels, any(x IN rels WHERE coalesce(x.is_rpc, false) = true) AS has_rpc
+                FOREACH (rel IN rels | SET rel.is_rpc = has_rpc)
+                FOREACH (rel IN tail(rels) | DELETE rel)
+            """)
 
     def _create_inheritance_links(self, session, file_data: Dict, imports_map: dict):
         """Create INHERITS relationships with a more robust resolution logic."""
@@ -872,9 +1355,9 @@ class GraphBuilder:
                         path=caller_file_path,
                         parent_name=base_name)
 
-    def _create_all_inheritance_links(self, all_file_data: list[Dict], imports_map: dict):
+    def _create_all_inheritance_links(self, all_file_data: list[Dict], imports_map: dict, execution_context=None):
         """Create INHERITS relationships for all classes after all files have been processed."""
-        with self.driver.session() as session:
+        with self._execution_context(execution_context) as session:
             for file_data in all_file_data:
                 # Handle C# separately
                 if file_data.get('lang') == 'c_sharp':
@@ -882,10 +1365,10 @@ class GraphBuilder:
                 else:
                     self._create_inheritance_links(session, file_data, imports_map)
                 
-    def delete_file_from_graph(self, path: str):
+    def delete_file_from_graph(self, path: str, execution_context=None):
         """Deletes a file and all its contained elements and relationships."""
         file_path_str = str(Path(path).resolve())
-        with self.driver.session() as session:
+        with self._execution_context(execution_context) as session:
             parents_res = session.run("""
                 MATCH (f:File {path: $path})<-[:CONTAINS*]-(d:Directory)
                 RETURN d.path as path ORDER BY d.path DESC
@@ -909,10 +1392,10 @@ class GraphBuilder:
                     DETACH DELETE d
                 """, path=path)
 
-    def delete_repository_from_graph(self, repo_path: str) -> bool:
+    def delete_repository_from_graph(self, repo_path: str, execution_context=None) -> bool:
         """Deletes a repository and all its contents from the graph. Returns True if deleted, False if not found."""
         repo_path_str = str(Path(repo_path).resolve())
-        with self.driver.session() as session:
+        with self._execution_context(execution_context) as session:
             # Check if it exists
             result = session.run("MATCH (r:Repository {path: $path}) RETURN count(r) as cnt", path=repo_path_str).single()
             if not result or result["cnt"] == 0:
@@ -925,18 +1408,18 @@ class GraphBuilder:
             info_logger(f"Deleted repository and its contents from graph: {repo_path_str}")
             return True
 
-    def update_file_in_graph(self, path: Path, repo_path: Path, imports_map: dict):
+    def update_file_in_graph(self, path: Path, repo_path: Path, imports_map: dict, execution_context=None):
         """Updates a single file's nodes in the graph."""
         file_path_str = str(path.resolve())
         repo_name = repo_path.name
         
-        self.delete_file_from_graph(file_path_str)
+        self.delete_file_from_graph(file_path_str, execution_context=execution_context)
 
         if path.exists():
             file_data = self.parse_file(repo_path, path)
             
             if "error" not in file_data:
-                self.add_file_to_graph(file_data, repo_name, imports_map)
+                self.add_file_to_graph(file_data, repo_name, imports_map, execution_context=execution_context)
                 return file_data
             else:
                 error_logger(f"Skipping graph add for {file_path_str} due to parsing error: {file_data['error']}")
@@ -1011,7 +1494,12 @@ class GraphBuilder:
             return None
 
     async def _build_graph_from_scip(
-        self, path: Path, is_dependency: bool, job_id: Optional[str], lang: str
+        self,
+        path: Path,
+        is_dependency: bool,
+        job_id: Optional[str],
+        lang: str,
+        execution_context=None,
     ):
         """
         SCIP-based indexing path. Activated only when SCIP_INDEXER=true and
@@ -1031,7 +1519,7 @@ class GraphBuilder:
         if job_id:
             self.job_manager.update_job(job_id, status=JobStatus.RUNNING)
 
-        self.add_repository_to_graph(path, is_dependency)
+        self.add_repository_to_graph(path, is_dependency, execution_context=execution_context)
         repo_name = path.name
 
         try:
@@ -1101,10 +1589,12 @@ class GraphBuilder:
                             
                             # 4. Variables/Other: value, etc.
                             file_data["variables"] = ts_data.get("variables", [])
+                            # 5. RPC metadata: independent bundle from language parser
+                            file_data["rpc"] = ts_data.get("rpc", {})
                     except Exception as e:
                         debug_log(f"Tree-sitter supplement failed for {abs_path_str}: {e}")
 
-                self.add_file_to_graph(file_data, repo_name, imports_map)
+                self.add_file_to_graph(file_data, repo_name, imports_map, execution_context=execution_context)
 
                 processed += 1
                 if job_id:
@@ -1112,10 +1602,14 @@ class GraphBuilder:
                 await asyncio.sleep(0.01)
 
             # Step 6: Create INHERITS relationships (Supplemented from Tree-sitter)
-            self._create_all_inheritance_links(list(files_data.values()), imports_map)
+            self._create_all_inheritance_links(
+                list(files_data.values()),
+                imports_map,
+                execution_context=execution_context,
+            )
 
             # Step 7: Write SCIP CALLS edges — precise cross-file resolution
-            with self.driver.session() as session:
+            with self._execution_context(execution_context) as session:
                 for file_data in files_data.values():
                     for edge in file_data.get("function_calls_scip", []):
                         try:
@@ -1123,7 +1617,7 @@ class GraphBuilder:
                             session.run("""
                                 MATCH (caller:Function {name: $caller_name, path: $caller_file, line_number: $caller_line})
                                 MATCH (callee:Function {name: $callee_name, path: $callee_file, line_number: $callee_line})
-                                MERGE (caller)-[:CALLS {line_number: $ref_line, source: 'scip'}]->(callee)
+                                MERGE (caller)-[:CALLS {line_number: $ref_line, source: 'scip', is_rpc: false}]->(callee)
                             """,
                             caller_name=self._name_from_symbol(edge["caller_symbol"]),
                             caller_file=edge["caller_file"],
@@ -1135,6 +1629,9 @@ class GraphBuilder:
                             )
                         except Exception:
                             pass  # best-effort: node might not be indexed yet
+
+            # Step 8: RPC markers and RPC CALLS edges (from tree-sitter RPC extraction)
+            self._create_all_rpc_calls(list(files_data.values()), execution_context=execution_context)
 
             if job_id:
                 self.job_manager.update_job(job_id, status=JobStatus.COMPLETED, end_time=datetime.now())
@@ -1169,7 +1666,11 @@ class GraphBuilder:
 
 
     async def build_graph_from_path_async(
-        self, path: Path, is_dependency: bool = False, job_id: str = None
+        self,
+        path: Path,
+        is_dependency: bool = False,
+        job_id: str = None,
+        execution_context=None,
     ):
         """Builds graph from a directory or file path."""
         try:
@@ -1188,7 +1689,13 @@ class GraphBuilder:
 
                 if detected_lang and is_scip_available(detected_lang):
                     info_logger(f"SCIP_INDEXER=true — using SCIP for language: {detected_lang}")
-                    await self._build_graph_from_scip(path, is_dependency, job_id, detected_lang)
+                    await self._build_graph_from_scip(
+                        path,
+                        is_dependency,
+                        job_id,
+                        detected_lang,
+                        execution_context=execution_context,
+                    )
                     return   # SCIP handled it; skip Tree-sitter pipeline below
                 else:
                     if detected_lang:
@@ -1207,7 +1714,7 @@ class GraphBuilder:
             if job_id:
                 self.job_manager.update_job(job_id, status=JobStatus.RUNNING)
             
-            self.add_repository_to_graph(path, is_dependency)
+            self.add_repository_to_graph(path, is_dependency, execution_context=execution_context)
             repo_name = path.name
 
             # Search for .cgcignore upwards
@@ -1292,15 +1799,29 @@ class GraphBuilder:
                     repo_path = path.resolve() if path.is_dir() else file.parent.resolve()
                     file_data = self.parse_file(repo_path, file, is_dependency)
                     if "error" not in file_data:
-                        self.add_file_to_graph(file_data, repo_name, imports_map)
+                        self.add_file_to_graph(
+                            file_data,
+                            repo_name,
+                            imports_map,
+                            execution_context=execution_context,
+                        )
                         all_file_data.append(file_data)
                     processed_count += 1
                     if job_id:
                         self.job_manager.update_job(job_id, processed_files=processed_count)
                     await asyncio.sleep(0.01)
 
-            self._create_all_inheritance_links(all_file_data, imports_map)
-            self._create_all_function_calls(all_file_data, imports_map)
+            self._create_all_inheritance_links(
+                all_file_data,
+                imports_map,
+                execution_context=execution_context,
+            )
+            self._create_all_function_calls(
+                all_file_data,
+                imports_map,
+                execution_context=execution_context,
+            )
+            self._create_all_rpc_calls(all_file_data, execution_context=execution_context)
             
             if job_id:
                 self.job_manager.update_job(job_id, status=JobStatus.COMPLETED, end_time=datetime.now())

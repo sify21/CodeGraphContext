@@ -68,7 +68,7 @@ class JobManager:
     about background jobs. It stores job information in memory.
     """
     def __init__(self):
-        self.jobs: Dict[str, JobInfo] = {}
+        self.jobs: dict[str, JobInfo] = {}
         self.lock = threading.Lock() # A lock to ensure thread-safe access to the jobs dictionary.
 
     def create_job(self, path: str, is_dependency: bool = False) -> str:

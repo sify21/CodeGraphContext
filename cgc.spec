@@ -283,25 +283,33 @@ a = Analysis(
 
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
 
-# ── 5. ONE-FILE EXE ──────────────────────────────────────────────────────────
+# ── 5. ONE-DIR BUILD ─────────────────────────────────────────────────────────
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
     [],
+    exclude_binaries=True,
     name='cgc',
     debug=False,
     bootloader_ignore_signals=False,
     strip=not is_win,  # strip fails on windows often
     upx=False,
     upx_exclude=[],
-    runtime_tmpdir=None,
     console=True,
     disable_windowed_traceback=False,
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
     icon=None,
+)
+
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=not is_win,
+    upx=False,
+    upx_exclude=[],
+    name='cgc',
 )

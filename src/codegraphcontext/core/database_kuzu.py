@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Optional, Tuple, Dict, Any, List
 
 from codegraphcontext.utils.debug_log import debug_log, info_logger, error_logger, warning_logger
+from .transaction import BackendCapabilities
 
 class KuzuDBManager:
     """
@@ -156,6 +157,27 @@ class KuzuDBManager:
     def get_backend_type(self) -> str:
         """Returns the database backend type."""
         return 'kuzudb'
+
+    def get_capabilities(self) -> BackendCapabilities:
+        """
+        Returns backend capabilities for orchestration decisions.
+
+        Kuzu wrapper currently executes queries in auto-commit mode.
+        """
+        return BackendCapabilities(
+            backend="kuzudb",
+            supports_transactions=False,
+            supports_concurrent_writes=False,
+            supports_session_scoped_reads=False,
+        )
+
+    def open_session(self):
+        """Opens a backend session through the existing driver wrapper."""
+        return self.get_driver().session()
+
+    def begin_transaction(self):
+        """Explicit transactions are not exposed in the current Kuzu wrapper."""
+        return None
 
     @staticmethod
     def validate_config(db_path: str = None) -> Tuple[bool, Optional[str]]:

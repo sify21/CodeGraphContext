@@ -3,6 +3,9 @@ from typing import Any, Dict, Optional, Tuple
 import re
 from codegraphcontext.utils.debug_log import debug_log, info_logger, error_logger, warning_logger
 from codegraphcontext.utils.tree_sitter_manager import execute_query
+from codegraphcontext.tools.languages.rpc.java import (
+    run_java_rpc_queries,
+)
 
 JAVA_QUERIES = {
     "functions": """
@@ -79,6 +82,7 @@ class JavaTreeSitterParser:
                     "variables": [],
                     "imports": [],
                     "function_calls": [],
+                    "rpc": {},
                     "is_dependency": is_dependency,
                     "lang": self.language_name,
                 }
@@ -90,6 +94,7 @@ class JavaTreeSitterParser:
             parsed_variables = []
             parsed_imports = []
             parsed_calls = []
+            rpc_bundle = {}
 
             for capture_name, query in JAVA_QUERIES.items():
                 results = execute_query(self.language, query, tree.root_node)
@@ -106,6 +111,15 @@ class JavaTreeSitterParser:
                     # results for variables query
                     parsed_variables = self._parse_variables(results, source_code, path)
 
+            # 查询 RPC 相关节点，作为独立字段返回（不与通用结果合并）
+            try:
+                rpc_bundle = run_java_rpc_queries(
+                    self.language, tree, source_code, path=path
+                )
+            except Exception as e:
+                warning_logger(f"Java RPC analysis skipped for {path}: {e}")
+                rpc_bundle = {}
+
             return {
                 "path": str(path),
                 "functions": parsed_functions,
@@ -113,6 +127,7 @@ class JavaTreeSitterParser:
                 "variables": parsed_variables,
                 "imports": parsed_imports,
                 "function_calls": parsed_calls,
+                "rpc": rpc_bundle,
                 "is_dependency": is_dependency,
                 "lang": self.language_name,
             }
@@ -126,6 +141,7 @@ class JavaTreeSitterParser:
                 "variables": [],
                 "imports": [],
                 "function_calls": [],
+                "rpc": {},
                 "is_dependency": is_dependency,
                 "lang": self.language_name,
             }

@@ -22,6 +22,14 @@ from ..core.jobs import JobManager
 from ..tools.code_finder import CodeFinder
 from ..tools.graph_builder import GraphBuilder
 from ..tools.package_resolver import get_local_package_path
+from ..tools.diff import (
+    ChangeMapper,
+    ChainSnapshotService,
+    GnuDiffProvider,
+    ImpactAnalyzer,
+    ReindexService,
+    DiffOrchestrator,
+)
 
 console = Console()
 
@@ -666,6 +674,103 @@ def reindex_helper(path: str):
         console.print(f"[green]Successfully re-indexed: {path} in {elapsed:.2f} seconds[/green]")
     except Exception as e:
         console.print(f"[bold red]An error occurred during re-indexing:[/bold red] {e}")
+    finally:
+        db_manager.close_driver()
+
+
+def diff_helper(
+    new_path: str,
+    old_path: str,
+    max_depth: int = 6,
+    chain_limit: int = 200,
+    report_json: str|None = None,
+    report_format: str = "both",
+    commit: bool = False,
+):
+    """
+    Generate an impact report from GNU diff output.
+
+    This is a skeleton implementation meant to establish stable interfaces.
+    Detailed symbol/chain impact logic can be iterated independently.
+    """
+    services = _initialize_services()
+    if not all(services):
+        return
+
+    db_manager, graph_builder, code_finder = services
+    new_path_obj = Path(new_path).resolve()
+    old_path_obj = Path(old_path).resolve()
+
+    if not new_path_obj.exists():
+        console.print(f"[red]Error: new path does not exist: {new_path_obj}[/red]")
+        db_manager.close_driver()
+        return
+    if not old_path_obj.exists():
+        console.print(f"[red]Error: old path does not exist: {old_path_obj}[/red]")
+        db_manager.close_driver()
+        return
+
+    capabilities = None
+    supports_tx = False
+    if hasattr(db_manager, "get_capabilities"):
+        capabilities = db_manager.get_capabilities()
+    if capabilities is not None:
+        supports_tx = bool(getattr(capabilities, "supports_transactions", False))
+
+    if not commit and not supports_tx:
+        backend = "unknown"
+        if hasattr(db_manager, "get_backend_type"):
+            backend = str(db_manager.get_backend_type())
+        console.print("[bold red]Dry-run diff is not supported on the current backend.[/bold red]")
+        console.print(f"[yellow]Current backend:[/yellow] {backend}")
+        console.print(
+            "[dim]Dry-run requires transaction rollback support (currently available on Neo4j).[/dim]"
+        )
+        console.print("[cyan]Try one of the following:[/cyan]")
+        console.print("  1) Switch backend: cgc --database neo4j diff ...")
+        console.print("  2) Use --commit on this backend: cgc diff ... --commit")
+        db_manager.close_driver()
+        return
+
+    try:
+        orchestrator = DiffOrchestrator(
+            diff_provider=GnuDiffProvider(),
+            change_mapper=ChangeMapper(graph_builder),
+            chain_snapshot_service=ChainSnapshotService(code_finder),
+            reindex_service=ReindexService(graph_builder, code_finder),
+            impact_analyzer=ImpactAnalyzer(),
+        )
+
+        report = asyncio.run(
+            orchestrator.run(
+                old_path=str(old_path_obj),
+                new_path=str(new_path_obj),
+                max_depth=max_depth,
+                chain_limit=chain_limit,
+                commit=commit,
+            )
+        )
+
+        if report_format in ("summary", "both"):
+            stats = report.stats
+            if commit:
+                console.print("[bold green]Diff completed and graph replacement committed[/bold green]")
+            else:
+                console.print("[bold green]Diff completed (dry-run, no graph replacement)[/bold green]")
+            console.print(
+                f"[cyan]Changed files:[/cyan] {stats.get('changed_files', 0)} | "
+                f"[cyan]Added chains:[/cyan] {stats.get('added_chains', 0)} | "
+                f"[cyan]Removed chains:[/cyan] {stats.get('removed_chains', 0)} | "
+                f"[cyan]Affected existing:[/cyan] {stats.get('affected_existing_chains', 0)}"
+            )
+
+        if report_json or report_format in ("json", "both"):
+            output_path = Path(report_json).resolve() if report_json else Path("cgc_reindex_impact.json").resolve()
+            output_path.write_text(json.dumps(report.to_dict(), indent=2), encoding="utf-8")
+            console.print(f"[green]Impact report written:[/green] {output_path}")
+
+    except Exception as e:
+        console.print(f"[bold red]An error occurred during reindex with diff:[/bold red] {e}")
     finally:
         db_manager.close_driver()
 

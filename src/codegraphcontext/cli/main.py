@@ -13,7 +13,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 from rich import box
-from typing import Optional
+from typing import Any, Dict, Optional
 import asyncio
 import logging
 import json
@@ -42,6 +42,7 @@ from .cli_helpers import (
     watch_helper,
     unwatch_helper,
     list_watching_helper,
+    diff_helper,
 )
 
 # Set the log level for the noisy neo4j, asyncio, and urllib3 loggers to keep the output clean.
@@ -880,12 +881,52 @@ def index(
     _load_credentials()
     if path is None:
         path = str(Path.cwd())
-    
     if force:
         console.print("[yellow]Force re-indexing (--force flag detected)[/yellow]")
         reindex_helper(path)
     else:
         index_helper(path)
+
+
+@app.command("diff")
+def diff(
+    path: Optional[str] = typer.Argument(None, help="Path to the new repository snapshot. Defaults to current directory."),
+    old_path: str = typer.Option(..., "--old-path", help="Path to the previous repository snapshot"),
+    max_depth: int = typer.Option(6, "--max-depth", help="Maximum call-chain depth for impact analysis"),
+    chain_limit: int = typer.Option(200, "--chain-limit", help="Maximum chains per start node for impact analysis"),
+    report_json: Optional[str] = typer.Option(None, "--report-json", help="Path to write the impact JSON report"),
+    report_format: str = typer.Option("both", "--report-format", help="Report format: summary|json|both"),
+    commit: bool = typer.Option(
+        False,
+        "--commit",
+        help="Apply graph replacement after diff. Without --commit, dry-run requires a transactional backend (Neo4j).",
+    ),
+):
+    """
+    Computes diff-based impact report between two repository snapshots.
+
+    By default this command does not replace existing graph data (dry-run mode).
+    Dry-run currently requires a transactional backend (Neo4j) so changes can be rolled back safely.
+    Use --commit to apply replacement of the old graph with the new snapshot graph.
+
+    This command currently provides a stable interface for:
+    - GNU diff based file/hunk detection
+    - Dry-run impact analysis (transactional backend required)
+    - Optional graph replacement (enabled only with --commit)
+    - Added/removed/affected call-chain report output
+    """
+    _load_credentials()
+    if path is None:
+        path = str(Path.cwd())
+    diff_helper(
+        new_path=path,
+        old_path=old_path,
+        max_depth=max_depth,
+        chain_limit=chain_limit,
+        report_json=report_json,
+        report_format=report_format,
+        commit=commit,
+    )
 
 @app.command()
 def clean():
@@ -1546,6 +1587,30 @@ def find_by_argument_search(
 analyze_app = typer.Typer(help="Analyze code relationships, dependencies, and quality")
 app.add_typer(analyze_app, name="analyze")
 
+
+def _parse_chain_node_ref_json(raw_json: str) -> Dict[str, Any]:
+    """Parse and lightly validate a chain node reference JSON."""
+    try:
+        data = json.loads(raw_json)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON for --start: {e.msg}") from e
+
+    if not isinstance(data, dict):
+        raise ValueError("--start must be a JSON object")
+
+    label = data.get("label")
+    props = data.get("props")
+
+    if not isinstance(label, str) or not label.strip():
+        raise ValueError("--start.label must be a non-empty string")
+    if not isinstance(props, dict) or not props:
+        raise ValueError("--start.props must be a non-empty object")
+
+    return {
+        "label": label.strip(),
+        "props": props,
+    }
+
 @analyze_app.command("calls")
 def analyze_calls(
     ctx: typer.Context,
@@ -1728,6 +1793,63 @@ def analyze_chain(
                         args_info = f" [dim]({args_str})[/dim]"
                     
                     console.print(f"{indent}  ⬇ [dim]calls at line {line}[/dim]{args_info}")
+    finally:
+        db_manager.close_driver()
+
+
+@analyze_app.command("chain-starts")
+def analyze_chain_starts():
+    """
+    Return all call-chain start points as JSON.
+
+    A start point is any node with outgoing CALLS edges and no incoming CALLS edges.
+    """
+    _load_credentials()
+    services = _initialize_services()
+    if not all(services):
+        return
+    db_manager, graph_builder, code_finder = services
+
+    try:
+        results = code_finder.find_call_chain_starts()
+        payload = {
+            "total_start_points": len(results),
+            "start_points": results,
+        }
+        console.print_json(json.dumps(payload, ensure_ascii=False, indent=2))
+    finally:
+        db_manager.close_driver()
+
+
+@analyze_app.command("chains-from")
+def analyze_chains_from(
+    start: str = typer.Option(..., "--start", help='Start node JSON, e.g. {"label":"Function","props":{"name":"foo","path":"/repo/a.py","line_number":10}}'),
+    max_depth: Optional[int] = typer.Option(None, "--max-depth", "-d", min=1, help="Optional maximum traversal depth"),
+    limit: Optional[int] = typer.Option(None, "--limit", "-l", min=1, help="Optional maximum number of returned chains")
+):
+    """
+    Return full call chains from a start node to sink nodes as JSON.
+
+    A sink node is a node with no outgoing CALLS edges.
+    """
+    _load_credentials()
+    services = _initialize_services()
+    if not all(services):
+        return
+    db_manager, graph_builder, code_finder = services
+
+    try:
+        start_ref = _parse_chain_node_ref_json(start)
+        result = code_finder.find_call_chains_from_node(
+            start_ref["label"],
+            start_ref["props"],
+            max_depth=max_depth,
+            limit=limit,
+        )
+        console.print_json(json.dumps(result, ensure_ascii=False, indent=2))
+    except ValueError as e:
+        console.print(f"[bold red]Invalid input:[/bold red] {e}")
+        raise typer.Exit(code=1)
     finally:
         db_manager.close_driver()
 

@@ -5,10 +5,11 @@ This module provides a thread-safe singleton manager for the Neo4j database conn
 import os
 import re
 import threading
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 from neo4j import GraphDatabase, Driver
 
 from codegraphcontext.utils.debug_log import debug_log, info_logger, error_logger, warning_logger
+from .transaction import BackendCapabilities
 
 class Neo4jDriverWrapper:
     """
@@ -27,6 +28,34 @@ class Neo4jDriverWrapper:
     def close(self):
         """Proxy method to close the underlying driver."""
         self._driver.close()
+
+
+class Neo4jTransactionWrapper:
+    """Wrapper for a Neo4j transaction with lifecycle controls."""
+
+    def __init__(self, session: Any, tx: Any):
+        self._session = session
+        self._tx = tx
+        self._closed = False
+
+    def run(self, query: str, **parameters: Any):
+        return self._tx.run(query, **parameters)
+
+    def commit(self) -> None:
+        if self._closed:
+            return
+        self._tx.commit()
+
+    def rollback(self) -> None:
+        if self._closed:
+            return
+        self._tx.rollback()
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._session.close()
+        self._closed = True
 
 class DatabaseManager:
     """
@@ -147,6 +176,30 @@ class DatabaseManager:
     def get_backend_type(self) -> str:
         """Returns the database backend type."""
         return 'neo4j'
+
+    def get_capabilities(self) -> BackendCapabilities:
+        """Returns backend capabilities for orchestration decisions."""
+        return BackendCapabilities(
+            backend="neo4j",
+            supports_transactions=True,
+            supports_concurrent_writes=True,
+            supports_session_scoped_reads=True,
+        )
+
+    def open_session(self):
+        """Opens a backend session through the standard wrapper."""
+        return self.get_driver().session()
+
+    def begin_transaction(self) -> Neo4jTransactionWrapper:
+        """
+        Starts an explicit write transaction.
+
+        The caller is responsible for commit/rollback and close.
+        """
+        driver_wrapper = self.get_driver()
+        session = driver_wrapper.session()
+        tx = session.begin_transaction()
+        return Neo4jTransactionWrapper(session=session, tx=tx)
 
 
     @staticmethod
