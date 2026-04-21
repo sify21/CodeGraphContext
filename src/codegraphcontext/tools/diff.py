@@ -3,9 +3,13 @@ from __future__ import annotations
 import asyncio
 import re
 import subprocess
+import pprint
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal, override
+
+from ..core.jobs import JobManager, JobStatus
+from ..utils.debug_log import debug_log
 
 from .graph_builder import GraphBuilder
 from .code_finder import CodeFinder
@@ -34,7 +38,6 @@ class DiffResult:
     old_root: str
     new_root: str
     files: list[FileChange]
-    raw_patch: str = ""
 
 
 @dataclass
@@ -89,14 +92,14 @@ class UnifiedDiffParser:
         for line in patch_text.splitlines():
             if line.startswith("--- "):
                 old_path = line[4:].split("\t", 1)[0].strip()
-                if old_path == "/dev/null":
+                if old_path == "/dev/null" or "\t1970-01-01" in line:
                     old_path = None
                 current = FileChange(change_type="modified", old_path=old_path, new_path=None, hunks=[])
                 continue
 
             if line.startswith("+++ ") and current is not None:
                 new_path = line[4:].split("\t", 1)[0].strip()
-                if new_path == "/dev/null":
+                if new_path == "/dev/null" or "\t1970-01-01" in line:
                     new_path = None
                 current.new_path = new_path
 
@@ -122,7 +125,7 @@ class UnifiedDiffParser:
                 new_count = int(match.group(4) or 1)
                 current.hunks.append(HunkRange(old_start, old_count, new_start, new_count))
 
-        return DiffResult(old_root=old_root, new_root=new_root, files=files, raw_patch=patch_text)
+        return DiffResult(old_root=old_root, new_root=new_root, files=files)
 
 
 class GnuDiffProvider(DiffProvider):
@@ -283,8 +286,9 @@ class ChangeMapper:
 
 
 class ChainSnapshotService:
-    def __init__(self, code_finder: CodeFinder):
+    def __init__(self, code_finder: CodeFinder, job_manager: JobManager):
         self.code_finder: CodeFinder = code_finder
+        self.job_manager: JobManager = job_manager
 
     @staticmethod
     def _symbol_lookup_props(symbol: SymbolRef) -> dict[str, Any]:
@@ -300,6 +304,11 @@ class ChainSnapshotService:
         if symbol.line_number is not None:
             props["line_number"] = symbol.line_number
         return props
+
+    @staticmethod
+    def _format_symbol(symbol: SymbolRef) -> str:
+        line_number = symbol.line_number if symbol.line_number is not None else "-"
+        return f"{symbol.path}:{line_number}:{symbol.kind}:{symbol.name}"
 
     @staticmethod
     def _chain_signature(nodes: list[SymbolRef], edges: list[CallEdgeRef]) -> str:
@@ -340,6 +349,7 @@ class ChainSnapshotService:
         max_depth: int = 6,
         chain_limit: int = 200,
         execution_context=None,
+        job_id: str = "",
     ) -> list[CallChain]:
         if not symbols:
             return []
@@ -348,12 +358,17 @@ class ChainSnapshotService:
         used_ids: set[str] = set()
         chain_sigs: set[str] = set()
         emitted = 0
+        total_symbols = len(symbols)
+        self.job_manager.update_job(job_id, status=JobStatus.RUNNING, processed_files=0, total_files=total_symbols)
         for idx, symbol in enumerate(symbols):
+            self.job_manager.update_job(job_id, processed_files=idx+1, current_file=self._format_symbol(symbol))
             if emitted >= chain_limit:
                 break
             label = symbol.kind
             props = self._symbol_lookup_props(symbol)
+            debug_log(f"snapshot around symbol : {label} {props}")
             if not props:
+                debug_log(f"{symbol} no _symbol_lookup_props")
                 continue
 
             try:
@@ -364,7 +379,8 @@ class ChainSnapshotService:
                     limit=max(1, chain_limit - emitted),
                     execution_context=execution_context,
                 )
-            except ValueError:
+            except ValueError as e:
+                debug_log(f"{symbol} ERROR: {e}")
                 continue
             for chain_idx, chain in enumerate(result.get("chains", [])):
                 node_chain = chain.get("node_chain") or []
@@ -409,6 +425,7 @@ class ChainSnapshotService:
                 if emitted >= chain_limit:
                     break
 
+        self.job_manager.update_job(job_id, status=JobStatus.COMPLETED)
         return chains
 
 
@@ -452,9 +469,22 @@ class ReindexService:
 
 class ImpactAnalyzer:
     @staticmethod
-    def _chain_key(chain: CallChain) -> str:
+    def _normalize_path(path: str, repo_root: str) -> str:
+        if not path:
+            return ""
+
+        path_obj = Path(path).resolve()
+        try:
+            return path_obj.relative_to(Path(repo_root).resolve()).as_posix()
+        except ValueError:
+            pass
+        return path_obj.as_posix()
+
+    @classmethod
+    def _chain_key(cls, chain: CallChain, repo_root: str) -> str:
         node_key = "->".join(
-            f"{n.kind}:{n.name or ''}:{n.path}:{n.line_number or 0}" for n in chain.nodes
+            f"{n.kind}:{n.name or ''}:{cls._normalize_path(n.path, repo_root)}:{n.line_number or 0}"
+            for n in chain.nodes
         )
         edge_key = "->".join(
             f"{e.line_number or 0}:{e.full_call_name or ''}:{bool(e.is_rpc)}" for e in chain.edges
@@ -466,12 +496,12 @@ class ImpactAnalyzer:
         before_chains: list[CallChain],
         after_chains: list[CallChain],
         changed_symbols_after: list[SymbolRef],
-        old_path: str,
-        new_path: str,
+        old_root: str,
+        new_root: str,
         changed_files: list[FileChange],
     ) -> ImpactReport:
-        before_map = {self._chain_key(c): c for c in before_chains}
-        after_map = {self._chain_key(c): c for c in after_chains}
+        before_map = {self._chain_key(c, old_root): c for c in before_chains}
+        after_map = {self._chain_key(c, new_root): c for c in after_chains}
 
         before_keys = set(before_map.keys())
         after_keys = set(after_map.keys())
@@ -480,28 +510,20 @@ class ImpactAnalyzer:
         removed = [before_map[k] for k in sorted(before_keys - after_keys)]
         common = [after_map[k] for k in sorted(before_keys & after_keys)]
 
-        changed_paths = {
-            p for fc in changed_files for p in (fc.old_path, fc.new_path) if p is not None
-        }
-        affected_existing = []
-        for chain in common:
-            if any(node.path in changed_paths for node in chain.nodes):
-                affected_existing.append(chain)
-
         stats = {
             "changed_files": len(changed_files),
             "changed_symbols_after": len(changed_symbols_after),
             "added_chains": len(added),
             "removed_chains": len(removed),
-            "affected_existing_chains": len(affected_existing),
+            "affected_existing_chains": len(common),
         }
         return ImpactReport(
-            old_path=old_path,
-            new_path=new_path,
+            old_path=old_root,
+            new_path=new_root,
             changed_files=changed_files,
             added_chains=added,
             removed_chains=removed,
-            affected_existing_chains=affected_existing,
+            affected_existing_chains=common,
             stats=stats,
         )
 
@@ -528,16 +550,21 @@ class DiffOrchestrator:
         max_depth: int = 6,
         chain_limit: int = 200,
         commit: bool = False,
+        old_job_id: str = "",
+        new_job_id: str = "",
     ) -> ImpactReport:
         old_root = str(Path(old_path).resolve())
         new_root = str(Path(new_path).resolve())
         diff_result = self.diff_provider.collect_diff(old_root=old_root, new_root=new_root)
+        debug_log(f"diff_result:\n "+pprint.pformat(diff_result))
 
         changed_symbols_before = self.change_mapper.map_changes_to_symbols_before(diff_result, old_root)
+        debug_log(f"changed_symbols_before:\n"+pprint.pformat(changed_symbols_before))
         before_chains = self.chain_snapshot_service.snapshot_around_symbols(
             changed_symbols_before,
             max_depth=max_depth,
             chain_limit=chain_limit,
+            job_id=old_job_id,
         )
 
         tx_context = None
@@ -558,11 +585,13 @@ class DiffOrchestrator:
                 execution_context=tx_context,
             )
             changed_symbols_after = self.change_mapper.map_changes_to_symbols_after(diff_result, new_root)
+            debug_log(f"changed_symbols_after:\n"+pprint.pformat(changed_symbols_after))
             after_chains = self.chain_snapshot_service.snapshot_around_symbols(
                 changed_symbols_after,
                 max_depth=max_depth,
                 chain_limit=chain_limit,
                 execution_context=tx_context,
+                job_id=new_job_id,
             )
         finally:
             if tx_context is not None:
@@ -573,7 +602,7 @@ class DiffOrchestrator:
             before_chains=before_chains,
             after_chains=after_chains,
             changed_symbols_after=changed_symbols_after,
-            old_path=old_root,
-            new_path=new_root,
+            old_root=old_root,
+            new_root=new_root,
             changed_files=diff_result.files,
         )

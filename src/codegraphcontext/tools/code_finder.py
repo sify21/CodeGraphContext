@@ -1,11 +1,14 @@
 # src/codegraphcontext/tools/code_finder.py
 import logging
+import heapq
+from time import perf_counter
 
 from typing import Any, Dict, List, Literal, Optional
 from contextlib import contextmanager
 from pathlib import Path
 
 from ..core.database import DatabaseManager
+from ..utils.debug_log import debug_log
 
 logger = logging.getLogger(__name__)
 
@@ -835,7 +838,6 @@ class CodeFinder:
         if limit < 1:
             raise ValueError("limit must be >= 1")
 
-        depth_pattern = f"*1..{max_depth}"
         per_dir_limit = limit
 
         with self._execution_context(execution_context) as session:
@@ -862,83 +864,108 @@ class CodeFinder:
 
             center_point = center_matches[0]
 
-            downstream_result = session.run(f"""
-                MATCH (center:{label})
-                WHERE all(k IN keys($props) WHERE center[k] = $props[k])
-                MATCH path = (center)-[:CALLS{depth_pattern}]->(dst)
-                WHERE NOT (dst)-[:CALLS]->() OR length(path) = {max_depth}
-                RETURN
-                    [node IN nodes(path) | {{
-                        label:
-                            CASE
-                                WHEN node:Function THEN 'Function'
-                                WHEN node:Class THEN 'Class'
-                                WHEN node:File THEN 'File'
-                                WHEN node:Module THEN 'Module'
-                                ELSE head(labels(node))
-                            END,
-                        props: properties(node)
-                    }}] as node_chain,
-                    [rel IN relationships(path) | {{
-                        line_number: rel.line_number,
-                        args: rel.args,
-                        full_call_name: rel.full_call_name,
-                        source: rel.source,
-                        is_rpc: rel.is_rpc
-                    }}] as call_details,
-                    length(path) as chain_length
-                ORDER BY chain_length DESC
-                LIMIT {per_dir_limit}
-            """, props=props)
+            def _collect_directional_paths(direction: Literal["downstream", "upstream"]) -> list[dict[str, Any]]:
+                collected: list[dict[str, Any]] = []
+                for depth in range(max_depth, 0, -1):
+                    remaining = per_dir_limit - len(collected)
+                    if remaining <= 0:
+                        break
 
-            upstream_result = session.run(f"""
-                MATCH (center:{label})
-                WHERE all(k IN keys($props) WHERE center[k] = $props[k])
-                MATCH path = (src)-[:CALLS{depth_pattern}]->(center)
-                WHERE NOT ()-[:CALLS]->(src) OR length(path) = {max_depth}
-                RETURN
-                    [node IN nodes(path) | {{
-                        label:
-                            CASE
-                                WHEN node:Function THEN 'Function'
-                                WHEN node:Class THEN 'Class'
-                                WHEN node:File THEN 'File'
-                                WHEN node:Module THEN 'Module'
-                                ELSE head(labels(node))
-                            END,
-                        props: properties(node)
-                    }}] as node_chain,
-                    [rel IN relationships(path) | {{
-                        line_number: rel.line_number,
-                        args: rel.args,
-                        full_call_name: rel.full_call_name,
-                        source: rel.source,
-                        is_rpc: rel.is_rpc
-                    }}] as call_details,
-                    length(path) as chain_length
-                ORDER BY chain_length DESC
-                LIMIT {per_dir_limit}
-            """, props=props)
+                    if direction == "downstream":
+                        path_match = f"(center)-[:CALLS*{depth}..{depth}]->(dst)"
+                        # Keep original semantics:
+                        # - depth==max_depth: include all paths
+                        # - depth<max_depth: include only sink-terminated paths
+                        boundary_filter = "TRUE" if depth == max_depth else "NOT (dst)-[:CALLS]->()"
+                    else:
+                        path_match = f"(src)-[:CALLS*{depth}..{depth}]->(center)"
+                        # Keep original semantics:
+                        # - depth==max_depth: include all paths
+                        # - depth<max_depth: include only source-originated paths
+                        boundary_filter = "TRUE" if depth == max_depth else "NOT ()-[:CALLS]->(src)"
 
-            downstream_chains = downstream_result.data()
-            upstream_chains = upstream_result.data()
+                    run_start = perf_counter()
+                    debug_log(f"[find_call_paths_around_node] {direction} run start depth={depth} remaining={remaining}")
+                    result = session.run(f"""
+                        MATCH (center:{label})
+                        WHERE all(k IN keys($props) WHERE center[k] = $props[k])
+                        MATCH path = {path_match}
+                        WHERE {boundary_filter}
+                        RETURN
+                            [node IN nodes(path) | {{
+                                label:
+                                    CASE
+                                        WHEN node:Function THEN 'Function'
+                                        WHEN node:Class THEN 'Class'
+                                        WHEN node:File THEN 'File'
+                                        WHEN node:Module THEN 'Module'
+                                        ELSE head(labels(node))
+                                    END,
+                                props: properties(node)
+                            }}] as node_chain,
+                            [rel IN relationships(path) | {{
+                                line_number: rel.line_number,
+                                args: rel.args,
+                                full_call_name: rel.full_call_name,
+                                source: rel.source,
+                                is_rpc: rel.is_rpc
+                            }}] as call_details,
+                            length(path) as chain_length
+                        LIMIT {remaining}
+                    """, props=props)
+
+                    rows = result.data()
+                    debug_log(
+                        f"[find_call_paths_around_node] {direction} run end depth={depth} "
+                        f"rows={len(rows)} elapsed_ms={(perf_counter() - run_start) * 1000:.2f}"
+                    )
+                    if rows:
+                        collected.extend(rows)
+
+                return collected
+
+            downstream_chains = _collect_directional_paths("downstream")
+            upstream_chains = _collect_directional_paths("upstream")
             stitched_chains: list[dict[str, Any]] = []
 
             if upstream_chains and downstream_chains:
-                for up in upstream_chains:
+                # upstream_chains/downstream_chains are produced depth-descending,
+                # so picking top-K by merged length can avoid full Cartesian expansion.
+                up_lengths = [int(chain.get("chain_length", 0)) for chain in upstream_chains]
+                down_lengths = [int(chain.get("chain_length", 0)) for chain in downstream_chains]
+                heap: list[tuple[int, int, int]] = []
+                visited: set[tuple[int, int]] = set()
+
+                def push_pair(i: int, j: int) -> None:
+                    if i >= len(up_lengths) or j >= len(down_lengths):
+                        return
+                    key = (i, j)
+                    if key in visited:
+                        return
+                    visited.add(key)
+                    score = up_lengths[i] + down_lengths[j]
+                    heapq.heappush(heap, (-score, i, j))
+
+                push_pair(0, 0)
+                target = limit
+                while heap and len(stitched_chains) < target:
+                    _, i, j = heapq.heappop(heap)
+                    up = upstream_chains[i]
+                    down = downstream_chains[j]
                     up_nodes = up.get("node_chain") or []
                     up_calls = up.get("call_details") or []
-                    for down in downstream_chains:
-                        down_nodes = down.get("node_chain") or []
-                        down_calls = down.get("call_details") or []
-                        # Both paths include center; keep it only once in stitched chain.
-                        merged_nodes = up_nodes + down_nodes[1:]
-                        merged_calls = up_calls + down_calls
-                        stitched_chains.append({
-                            "node_chain": merged_nodes,
-                            "call_details": merged_calls,
-                            "chain_length": len(merged_calls),
-                        })
+                    down_nodes = down.get("node_chain") or []
+                    down_calls = down.get("call_details") or []
+                    # Both paths include center; keep it only once in stitched chain.
+                    merged_nodes = up_nodes + down_nodes[1:]
+                    merged_calls = up_calls + down_calls
+                    stitched_chains.append({
+                        "node_chain": merged_nodes,
+                        "call_details": merged_calls,
+                        "chain_length": len(merged_calls),
+                    })
+                    push_pair(i + 1, j)
+                    push_pair(i, j + 1)
             elif upstream_chains:
                 stitched_chains = upstream_chains
             elif downstream_chains:

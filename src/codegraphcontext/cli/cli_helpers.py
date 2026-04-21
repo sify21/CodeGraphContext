@@ -4,6 +4,7 @@ import uuid
 import urllib.parse
 from pathlib import Path
 import time
+from datetime import datetime
 from typing import Optional
 from rich.console import Console
 from rich.table import Table
@@ -29,6 +30,7 @@ from ..tools.diff import (
     ImpactAnalyzer,
     ReindexService,
     DiffOrchestrator,
+    SymbolRef,
 )
 
 console = Console()
@@ -677,6 +679,107 @@ def reindex_helper(path: str):
     finally:
         db_manager.close_driver()
 
+async def _run_diff_with_progress(
+    graph_builder: GraphBuilder,
+    code_finder: CodeFinder,
+    new_path_obj: Path,
+    old_path_obj: Path,
+    max_depth: int = 6,
+    chain_limit: int = 200,
+    report_json: str|None = None,
+    report_format: str = "both",
+    commit: bool = False,
+):
+    orchestrator = DiffOrchestrator(
+        diff_provider=GnuDiffProvider(),
+        change_mapper=ChangeMapper(graph_builder),
+        chain_snapshot_service=ChainSnapshotService(code_finder, JobManager()),
+        reindex_service=ReindexService(graph_builder, code_finder),
+        impact_analyzer=ImpactAnalyzer(),
+    )
+    from ..core.jobs import JobStatus
+    job_manager = orchestrator.chain_snapshot_service.job_manager
+    old_job_id = job_manager.create_job(str(old_path_obj))
+    new_job_id = job_manager.create_job(str(new_path_obj))
+    job_messages = {
+        old_job_id: "旧调用链波及...",
+        new_job_id: "新调用链波及...",
+    }
+    for job_id in [old_job_id, new_job_id]:
+        job_manager.update_job(
+            job_id,
+            status=JobStatus.PENDING,
+            total_files=0,
+            processed_files=0,
+            current_file=None,
+        )
+
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TextColumn("[dim]{task.fields[filename]}"),
+        console=console,
+        transient=True,
+    ) as progress:
+        task_ids = {
+            old_job_id: progress.add_task(job_messages[old_job_id], total=1, completed=0, filename=""),
+            new_job_id: progress.add_task(job_messages[new_job_id], total=1, completed=0, filename=""),
+        }
+
+        diff_task = asyncio.create_task(
+            orchestrator.run(
+                old_path=str(old_path_obj),
+                new_path=str(new_path_obj),
+                max_depth=max_depth,
+                chain_limit=chain_limit,
+                commit=commit,
+            )
+        )
+        while not diff_task.done():
+            for job_id in [old_job_id, new_job_id]:
+                job = job_manager.get_job(job_id)
+                if job:
+                    if job.total_files > 0:
+                        progress.update(task_ids[job_id], total=job.total_files, completed=job.processed_files)
+                    # Update the current filename in the UI
+                    current_file = job.current_file or ""
+                    if len(current_file) > 80:
+                        current_file = "..." + current_file[-77:]
+                    progress.update(task_ids[job_id], filename=current_file)
+
+            if all(
+                (job := job_manager.get_job(job_id)) is None or job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]
+                for job_id in [old_job_id, new_job_id]
+            ):
+                break
+            await asyncio.sleep(0.1)
+        report = await diff_task
+        for job_id in [old_job_id, new_job_id]:
+            job = job_manager.get_job(job_id)
+            if job and job.status == JobStatus.FAILED:
+                error_msg = job.errors[0] if job.errors else "Unknown error"
+                raise RuntimeError(error_msg)
+
+    if report_format in ("summary", "both"):
+        stats = report.stats
+        if commit:
+            console.print("[bold green]Diff completed and graph replacement committed[/bold green]")
+        else:
+            console.print("[bold green]Diff completed (dry-run, no graph replacement)[/bold green]")
+        console.print(
+            f"[cyan]Changed files:[/cyan] {stats.get('changed_files', 0)} | "
+            f"[cyan]Added chains:[/cyan] {stats.get('added_chains', 0)} | "
+            f"[cyan]Removed chains:[/cyan] {stats.get('removed_chains', 0)} | "
+            f"[cyan]Affected existing:[/cyan] {stats.get('affected_existing_chains', 0)}"
+        )
+
+    if report_json or report_format in ("json", "both"):
+        output_path = Path(report_json).resolve() if report_json else Path("cgc_reindex_impact.json").resolve()
+        output_path.write_text(json.dumps(report.to_dict(), indent=2), encoding="utf-8")
+        console.print(f"[green]Impact report written:[/green] {output_path}")
 
 def diff_helper(
     new_path: str,
@@ -732,43 +835,19 @@ def diff_helper(
         db_manager.close_driver()
         return
 
+
     try:
-        orchestrator = DiffOrchestrator(
-            diff_provider=GnuDiffProvider(),
-            change_mapper=ChangeMapper(graph_builder),
-            chain_snapshot_service=ChainSnapshotService(code_finder),
-            reindex_service=ReindexService(graph_builder, code_finder),
-            impact_analyzer=ImpactAnalyzer(),
+        asyncio.run(_run_diff_with_progress(
+            graph_builder,
+            code_finder,
+            new_path_obj,
+            old_path_obj,
+            max_depth,
+            chain_limit,
+            report_json,
+            report_format,
+            commit)
         )
-
-        report = asyncio.run(
-            orchestrator.run(
-                old_path=str(old_path_obj),
-                new_path=str(new_path_obj),
-                max_depth=max_depth,
-                chain_limit=chain_limit,
-                commit=commit,
-            )
-        )
-
-        if report_format in ("summary", "both"):
-            stats = report.stats
-            if commit:
-                console.print("[bold green]Diff completed and graph replacement committed[/bold green]")
-            else:
-                console.print("[bold green]Diff completed (dry-run, no graph replacement)[/bold green]")
-            console.print(
-                f"[cyan]Changed files:[/cyan] {stats.get('changed_files', 0)} | "
-                f"[cyan]Added chains:[/cyan] {stats.get('added_chains', 0)} | "
-                f"[cyan]Removed chains:[/cyan] {stats.get('removed_chains', 0)} | "
-                f"[cyan]Affected existing:[/cyan] {stats.get('affected_existing_chains', 0)}"
-            )
-
-        if report_json or report_format in ("json", "both"):
-            output_path = Path(report_json).resolve() if report_json else Path("cgc_reindex_impact.json").resolve()
-            output_path.write_text(json.dumps(report.to_dict(), indent=2), encoding="utf-8")
-            console.print(f"[green]Impact report written:[/green] {output_path}")
-
     except Exception as e:
         console.print(f"[bold red]An error occurred during reindex with diff:[/bold red] {e}")
     finally:
