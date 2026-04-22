@@ -343,7 +343,7 @@ class ChainSnapshotService:
             is_rpc=detail.get("is_rpc"),
         )
 
-    def snapshot_around_symbols(
+    async def snapshot_around_symbols(
         self,
         symbols: list[SymbolRef],
         max_depth: int = 6,
@@ -362,6 +362,7 @@ class ChainSnapshotService:
         self.job_manager.update_job(job_id, status=JobStatus.RUNNING, processed_files=0, total_files=total_symbols)
         for idx, symbol in enumerate(symbols):
             self.job_manager.update_job(job_id, processed_files=idx+1, current_file=self._format_symbol(symbol))
+            await asyncio.sleep(0.01) # hand over execution to cli_helpers in order to update progress
             if emitted >= chain_limit:
                 break
             label = symbol.kind
@@ -446,6 +447,7 @@ class ReindexService:
         new_root: str,
         execution_context=None,
         max_retries: int = 2,
+        job_id: str = "",
     ) -> None:
         attempt = 0
         while True:
@@ -458,6 +460,7 @@ class ReindexService:
                     Path(new_root).resolve(),
                     is_dependency=False,
                     execution_context=execution_context,
+                    job_id=job_id
                 )
                 return
             except Exception as e:
@@ -551,6 +554,7 @@ class DiffOrchestrator:
         chain_limit: int = 200,
         commit: bool = False,
         old_job_id: str = "",
+        reindex_job_id: str = "",
         new_job_id: str = "",
     ) -> ImpactReport:
         old_root = str(Path(old_path).resolve())
@@ -559,8 +563,7 @@ class DiffOrchestrator:
         debug_log(f"diff_result:\n "+pprint.pformat(diff_result))
 
         changed_symbols_before = self.change_mapper.map_changes_to_symbols_before(diff_result, old_root)
-        debug_log(f"changed_symbols_before:\n"+pprint.pformat(changed_symbols_before))
-        before_chains = self.chain_snapshot_service.snapshot_around_symbols(
+        before_chains = await self.chain_snapshot_service.snapshot_around_symbols(
             changed_symbols_before,
             max_depth=max_depth,
             chain_limit=chain_limit,
@@ -583,10 +586,10 @@ class DiffOrchestrator:
                 old_root,
                 new_root,
                 execution_context=tx_context,
+                job_id=reindex_job_id,
             )
             changed_symbols_after = self.change_mapper.map_changes_to_symbols_after(diff_result, new_root)
-            debug_log(f"changed_symbols_after:\n"+pprint.pformat(changed_symbols_after))
-            after_chains = self.chain_snapshot_service.snapshot_around_symbols(
+            after_chains = await self.chain_snapshot_service.snapshot_around_symbols(
                 changed_symbols_after,
                 max_depth=max_depth,
                 chain_limit=chain_limit,

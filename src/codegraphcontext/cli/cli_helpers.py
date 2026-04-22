@@ -700,12 +700,14 @@ async def _run_diff_with_progress(
     from ..core.jobs import JobStatus
     job_manager = orchestrator.chain_snapshot_service.job_manager
     old_job_id = job_manager.create_job(str(old_path_obj))
+    reindex_job_id = graph_builder.job_manager.create_job(str(new_path_obj))
     new_job_id = job_manager.create_job(str(new_path_obj))
     job_messages = {
-        old_job_id: "旧调用链波及...",
-        new_job_id: "新调用链波及...",
+        old_job_id: "旧调用链分析...",
+        reindex_job_id: "新建图库索引...",
+        new_job_id: "新调用链分析...",
     }
-    for job_id in [old_job_id, new_job_id]:
+    for job_id in [old_job_id, reindex_job_id, new_job_id]:
         job_manager.update_job(
             job_id,
             status=JobStatus.PENDING,
@@ -725,8 +727,9 @@ async def _run_diff_with_progress(
         transient=True,
     ) as progress:
         task_ids = {
-            old_job_id: progress.add_task(job_messages[old_job_id], total=1, completed=0, filename=""),
-            new_job_id: progress.add_task(job_messages[new_job_id], total=1, completed=0, filename=""),
+            old_job_id: progress.add_task(job_messages[old_job_id], filename=""),
+            reindex_job_id: progress.add_task(job_messages[reindex_job_id], filename=""),
+            new_job_id: progress.add_task(job_messages[new_job_id], filename=""),
         }
 
         diff_task = asyncio.create_task(
@@ -736,11 +739,14 @@ async def _run_diff_with_progress(
                 max_depth=max_depth,
                 chain_limit=chain_limit,
                 commit=commit,
+                old_job_id=old_job_id,
+                reindex_job_id=reindex_job_id,
+                new_job_id=new_job_id,
             )
         )
         while not diff_task.done():
-            for job_id in [old_job_id, new_job_id]:
-                job = job_manager.get_job(job_id)
+            for job_id in [old_job_id, reindex_job_id, new_job_id]:
+                job = job_manager.get_job(job_id) or graph_builder.job_manager.get_job(job_id)
                 if job:
                     if job.total_files > 0:
                         progress.update(task_ids[job_id], total=job.total_files, completed=job.processed_files)
@@ -751,14 +757,14 @@ async def _run_diff_with_progress(
                     progress.update(task_ids[job_id], filename=current_file)
 
             if all(
-                (job := job_manager.get_job(job_id)) is None or job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]
-                for job_id in [old_job_id, new_job_id]
+                (job := (job_manager.get_job(job_id)) or graph_builder.job_manager.get_job(job_id)) is None or job.status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]
+                for job_id in [old_job_id, reindex_job_id, new_job_id]
             ):
                 break
             await asyncio.sleep(0.1)
         report = await diff_task
-        for job_id in [old_job_id, new_job_id]:
-            job = job_manager.get_job(job_id)
+        for job_id in [old_job_id, reindex_job_id, new_job_id]:
+            job = job_manager.get_job(job_id) or graph_builder.job_manager.get_job(job_id)
             if job and job.status == JobStatus.FAILED:
                 error_msg = job.errors[0] if job.errors else "Unknown error"
                 raise RuntimeError(error_msg)
