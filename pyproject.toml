@@ -54,10 +54,6 @@ dev = [
 cgc = "codegraphcontext.cli.main:app"
 codegraphcontext = "codegraphcontext.cli.main:app"
 
-[build-system]
-requires = ["uv_build>=0.11.7,<0.12"]
-build-backend = "uv_build"
-
 [tool.setuptools]
 package-dir = { "" = "src" }
 include-package-data = true
@@ -83,3 +79,6 @@ markers = [
 dev = [
     "pyinstaller>=6.19.0",
 ]
+
+[tool.uv]
+package = true
